@@ -333,6 +333,80 @@ class UnloadingOut(BaseModel):
     created_at: str
 
 
+# ---------- 装船实绩登记 ----------
+
+
+class ActualEventIn(BaseModel):
+    event_seq: int = Field(..., ge=1, description="事件流水号（正整数）；同一方案内唯一，作为幂等键")
+    event_type: str = Field(..., description="事件类型：start=开工，finish=完工")
+    container_no: str = Field(..., description="箱号（须属于方案冻结排程）")
+    crane_no: int = Field(..., ge=1, description="岸桥编号（正整数，须在冻结排程岸桥范围内）")
+    minute: int = Field(..., ge=0, description="实际发生分钟（非负整数；完工须晚于开工）")
+
+    @field_validator("event_type")
+    @classmethod
+    def _event_type(cls, v: str) -> str:
+        if v not in ("start", "finish"):
+            raise ValueError("事件类型仅支持 'start'（开工）或 'finish'（完工）")
+        return v
+
+    @field_validator("container_no")
+    @classmethod
+    def _container_no(cls, v: str) -> str:
+        return _require_nonempty_str(v, "箱号")
+
+
+class ActualEventOut(BaseModel):
+    event_seq: int
+    event_type: str
+    container_no: str
+    crane_no: int
+    minute: int
+    recorded_at: str
+
+
+class ActualBoxOut(BaseModel):
+    container_no: str
+    stack: str
+    tier: int
+    status: str = Field(
+        ..., description="not_started=未开工；in_progress=已开工未完；finished=已完工"
+    )
+    actual_start_minute: int | None = None
+    actual_finish_minute: int | None = None
+    actual_crane_no: int | None = None
+    planned_start_minute: int
+    planned_finish_minute: int
+    planned_crane_no: int
+    start_minute_delta: int | None = Field(
+        None, description="实际开工−计划开工分钟；未开工为 null"
+    )
+    finish_minute_delta: int | None = Field(
+        None, description="实际完工−计划完工分钟；未完工为 null"
+    )
+    crane_changed: bool | None = Field(
+        None, description="实际开工岸桥是否与计划不同；未开工为 null"
+    )
+
+
+class ActualsOut(BaseModel):
+    plan_id: str
+    revision_no: int
+    plan_status: str = Field(
+        ..., description="confirmed=可继续登记；superseded=方案被新修订取代，实绩只读"
+    )
+    read_only: bool = Field(..., description="true=实绩已冻结只读（方案被取代）")
+    frozen_at: str = Field(..., description="首次登记冻结排程作为偏差基线的时刻")
+    baseline_crane_count: int
+    baseline_makespan: int
+    event_count: int
+    boxes: list[ActualBoxOut]
+    unfinished: list[str] = Field(..., description="未完箱箱号（未开工或已开工未完），按箱号升序")
+    events: list[ActualEventOut] = Field(
+        ..., description="已接受事件，按重放次序（分钟、先完工后开工、流水号）排列"
+    )
+
+
 class AssignmentOut(BaseModel):
     container_no: str
     slot_code: str

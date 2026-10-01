@@ -40,6 +40,9 @@ def _clean_tables():
     import app.models as models
     db = SessionLocal()
     try:
+        db.query(models.ActualsEvent).delete()
+        db.query(models.ActualsBaselineItem).delete()
+        db.query(models.ActualsBaseline).delete()
         db.query(models.LoadingScheduleItem).delete()
         db.query(models.LoadingSchedule).delete()
         db.query(models.UnloadingStepRow).delete()

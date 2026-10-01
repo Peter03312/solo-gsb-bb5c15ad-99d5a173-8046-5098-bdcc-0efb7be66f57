@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Response
 from sqlalchemy.orm import Session
 
 from app import services
 from app.database import get_db
 from app.schemas import (
+    ActualEventIn,
+    ActualEventOut,
+    ActualBoxOut,
+    ActualsOut,
     AssignmentOut,
     ManifestIn,
     ManifestRevisionOut,
@@ -363,3 +367,51 @@ def list_unloading_sequences(
 )
 def get_unloading_sequence(plan_id: str, db: Session = Depends(get_db)):
     return _unloading_out(services.get_unloading_sequence(db, plan_id))
+
+
+# ---------- 装船实绩登记 ----------
+
+
+def _actuals_out(view: dict) -> ActualsOut:
+    return ActualsOut(
+        plan_id=view["plan_id"],
+        revision_no=view["revision_no"],
+        plan_status=view["plan_status"],
+        read_only=view["read_only"],
+        frozen_at=view["frozen_at"],
+        baseline_crane_count=view["baseline_crane_count"],
+        baseline_makespan=view["baseline_makespan"],
+        event_count=view["event_count"],
+        boxes=[ActualBoxOut(**b) for b in view["boxes"]],
+        unfinished=view["unfinished"],
+        events=[ActualEventOut(**e) for e in view["events"]],
+    )
+
+
+@router.post(
+    "/plans/{plan_id}/actuals/events",
+    response_model=ActualsOut,
+    responses={404: {"model": MessageOut}, 409: {"model": MessageOut},
+               422: {"model": MessageOut}},
+    summary="登记逐箱实际开工/完工（事件流水；首次登记冻结当时排程为偏差基线）",
+)
+def register_actual_event(
+    plan_id: str,
+    body: ActualEventIn,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    view, idempotent = services.register_actual_event(db, plan_id, body)
+    # 同流水号同内容重试返回原结果（幂等 200）；新事件 201
+    response.status_code = 200 if idempotent else 201
+    return _actuals_out(view)
+
+
+@router.get(
+    "/plans/{plan_id}/actuals",
+    response_model=ActualsOut,
+    responses={404: {"model": MessageOut}},
+    summary="查询装船实绩：每箱状态、实际起止、相对冻结排程偏差与未完箱",
+)
+def get_actuals(plan_id: str, db: Session = Depends(get_db)):
+    return _actuals_out(services.build_actuals_view(db, plan_id))

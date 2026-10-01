@@ -8,7 +8,8 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app import models
-from app.schemas import (
+from app.actuals import ActualEvent, InvalidActualEvent, PlannedBox, order_events, replay
+from app.schemas import(
     ManifestIn,
     PlanConfirmIn,
     RestowCreateIn,
@@ -922,3 +923,361 @@ def utc_iso(dt) -> str | None:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc).isoformat()
     return dt.astimezone(timezone.utc).isoformat()
+
+
+# ---------- 装船实绩登记 ----------
+
+
+def _same_event(row, payload) -> bool:
+    """已接受事件行与本次提交内容是否完全一致（幂等判定）。"""
+    return (
+        row.event_type == payload.event_type
+        and row.container_no == payload.container_no
+        and row.crane_no == payload.crane_no
+        and row.minute == payload.minute
+    )
+
+
+def _baseline_boxes(items) -> list[PlannedBox]:
+    return [
+        PlannedBox(
+            no=i.container_no, stack=i.stack, tier=i.tier,
+            start_minute=i.start_minute, finish_minute=i.finish_minute,
+            crane_no=i.crane_no,
+        )
+        for i in items
+    ]
+
+
+def _actual_events(rows) -> list[ActualEvent]:
+    return [
+        ActualEvent(
+            event_seq=r.event_seq, event_type=r.event_type,
+            container_no=r.container_no, crane_no=r.crane_no, minute=r.minute,
+        )
+        for r in rows
+    ]
+
+
+def register_actual_event(
+    db: Session,
+    plan_id: str,
+    payload,
+) -> tuple[dict, bool]:
+    """登记一条装船实绩事件（开工/完工），返回 (实绩视图, 是否为同流水号幂等重试)。
+
+    首次登记冻结当时排程作为偏差基线；后续排程替换不改写已登记实绩与基线。
+    事件可晚到：已接受事件与新事件按实际分钟重放（同分钟先完工后开工）。
+    同一方案内流水号同内容重试返回原结果，异内容冲突（409）；
+    晚到事件使原链失效则整次拒绝且记录不变（422）。
+    方案被新修订取代后实绩只读（409）；无排程 404；箱不在方案 422。
+    """
+    plan = get_plan(db, plan_id)
+    if plan.status != "confirmed":
+        raise ConflictError(
+            f"方案当前状态为 {plan.status}：仅当前已确认方案可登记装船实绩；"
+            "方案被新修订取代后实绩只读"
+        )
+
+    schedule = db.scalar(
+        select(models.LoadingSchedule).where(
+            models.LoadingSchedule.plan_id == plan_id
+        )
+    )
+    if schedule is None:
+        raise BusinessError(
+            f"方案 {plan_id} 尚无装船排程，拒绝实绩登记（请先生成并确认装船排程）",
+            404,
+        )
+
+    # 锁前快速判定：基线与既有事件（锁内将基于冻结基线重新复核）
+    baseline = db.scalar(
+        select(models.ActualsBaseline).where(
+            models.ActualsBaseline.plan_id == plan_id
+        )
+    )
+    baseline_src = baseline if baseline is not None else schedule
+    existing_rows = list(
+        db.scalars(
+            select(models.ActualsEvent)
+            .where(models.ActualsEvent.plan_id == plan_id)
+            .order_by(models.ActualsEvent.id)
+        )
+    )
+    prior_seq = {e.event_seq: e for e in existing_rows}
+    if payload.event_seq in prior_seq:
+        old = prior_seq[payload.event_seq]
+        if _same_event(old, payload):
+            return build_actuals_view(db, plan_id), True
+        raise ConflictError(
+            f"事件流水号 {payload.event_seq} 已登记且内容不同"
+            f"（已登记：{old.event_type} 箱 {old.container_no} 桥 {old.crane_no} "
+            f"第 {old.minute} 分钟），异内容冲突，本次拒绝且记录不变"
+        )
+
+    # 按实际分钟重放：已接受事件 + 新事件须整体合法
+    boxes = _baseline_boxes(baseline_src.items)
+    candidate = _actual_events(existing_rows) + [
+        ActualEvent(
+            event_seq=payload.event_seq,
+            event_type=payload.event_type,
+            container_no=payload.container_no,
+            crane_no=payload.crane_no,
+            minute=payload.minute,
+        )
+    ]
+    try:
+        replay(candidate, boxes, crane_count=baseline_src.crane_count)
+    except InvalidActualEvent as exc:
+        raise BusinessError(f"实绩事件重放被拒绝：{exc.reason}", 422)
+
+    # 快照后结束只读事务；在独立连接的写锁内原子复核方案状态与基线后落库
+    new_event = (
+        payload.event_seq, payload.event_type, payload.container_no,
+        payload.crane_no, payload.minute,
+    )
+    db.rollback()
+
+    from app.database import engine
+
+    conn = engine.pool.connect()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("BEGIN IMMEDIATE")
+
+        # 写锁内复核方案状态（求解/等待期间可能已被新修订取代）
+        cursor.execute("SELECT status FROM plans WHERE id = ?", (plan_id,))
+        row = cursor.fetchone()
+        if row is None:
+            conn.rollback()
+            raise ConflictError("方案在实绩登记期间被删除，本次拒绝且记录不变")
+        if row[0] != "confirmed":
+            conn.rollback()
+            raise ConflictError(
+                f"保存前复核发现方案状态已为 {row[0]}（已被新修订取代），"
+                "本次实绩登记被拒绝且记录不变，实绩只读"
+            )
+
+        # 首次绑定：冻结当时排程作为偏差基线（锁内判定，并发首登只有一方创建）
+        cursor.execute(
+            "SELECT id FROM actuals_baselines WHERE plan_id = ?", (plan_id,)
+        )
+        brow = cursor.fetchone()
+        if brow is None:
+            cursor.execute(
+                "SELECT id, crane_count, makespan FROM loading_schedules "
+                "WHERE plan_id = ?",
+                (plan_id,),
+            )
+            srow = cursor.fetchone()
+            if srow is None:
+                conn.rollback()
+                raise ConflictError(
+                    "保存前复核发现装船排程已不存在，本次实绩登记被拒绝且记录不变"
+                )
+            schedule_id, crane_count, makespan = srow
+            cursor.execute(
+                "SELECT container_no, stack, tier, start_minute, finish_minute, "
+                "crane_no FROM loading_schedule_items WHERE schedule_id = ?",
+                (schedule_id,),
+            )
+            frozen_items = cursor.fetchall()
+            now = models._utcnow().strftime("%Y-%m-%d %H:%M:%S.%f")
+            cursor.execute(
+                "INSERT INTO actuals_baselines "
+                "(plan_id, schedule_id, crane_count, makespan, frozen_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (plan_id, schedule_id, crane_count, makespan, now),
+            )
+            baseline_id = cursor.lastrowid
+            cursor.executemany(
+                "INSERT INTO actuals_baseline_items "
+                "(baseline_id, container_no, stack, tier, start_minute, "
+                "finish_minute, crane_no) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [(baseline_id, *it) for it in frozen_items],
+            )
+            locked_crane_count = crane_count
+            locked_boxes = [
+                PlannedBox(
+                    no=it[0], stack=it[1], tier=it[2], start_minute=it[3],
+                    finish_minute=it[4], crane_no=it[5],
+                )
+                for it in frozen_items
+            ]
+        else:
+            baseline_id = brow[0]
+            cursor.execute(
+                "SELECT crane_count FROM actuals_baselines WHERE id = ?",
+                (baseline_id,),
+            )
+            locked_crane_count = cursor.fetchone()[0]
+            cursor.execute(
+                "SELECT container_no, stack, tier, start_minute, finish_minute, "
+                "crane_no FROM actuals_baseline_items WHERE baseline_id = ?",
+                (baseline_id,),
+            )
+            locked_boxes = [
+                PlannedBox(
+                    no=it[0], stack=it[1], tier=it[2], start_minute=it[3],
+                    finish_minute=it[4], crane_no=it[5],
+                )
+                for it in cursor.fetchall()
+            ]
+
+        # 锁内重读全部已接受事件：并发首登/并发写时以库内为准复核
+        cursor.execute(
+            "SELECT event_seq, event_type, container_no, crane_no, minute "
+            "FROM actuals_events WHERE plan_id = ? ORDER BY id",
+            (plan_id,),
+        )
+        locked_rows = cursor.fetchall()
+        locked_seqs = {r[0]: r for r in locked_rows}
+        if new_event[0] in locked_seqs:
+            old = locked_seqs[new_event[0]]
+            same = (
+                old[1] == new_event[1] and old[2] == new_event[2]
+                and old[3] == new_event[3] and old[4] == new_event[4]
+            )
+            conn.rollback()
+            if same:
+                db.expire_all()
+                return build_actuals_view(db, plan_id), True
+            raise ConflictError(
+                f"并发写入：事件流水号 {new_event[0]} 已被其他请求以不同内容登记，"
+                "本次拒绝且记录不变"
+            )
+
+        locked_events = [
+            ActualEvent(
+                event_seq=r[0], event_type=r[1], container_no=r[2],
+                crane_no=r[3], minute=r[4],
+            )
+            for r in locked_rows
+        ] + [
+            ActualEvent(
+                event_seq=new_event[0], event_type=new_event[1],
+                container_no=new_event[2], crane_no=new_event[3], minute=new_event[4],
+            )
+        ]
+        try:
+            replay(locked_events, locked_boxes, crane_count=locked_crane_count)
+        except InvalidActualEvent as exc:
+            conn.rollback()
+            raise BusinessError(
+                f"保存前复核：实绩事件重放被拒绝（{exc.reason}），记录不变", 422
+            )
+
+        now = models._utcnow().strftime("%Y-%m-%d %H:%M:%S.%f")
+        cursor.execute(
+            "INSERT INTO actuals_events "
+            "(plan_id, event_seq, event_type, container_no, crane_no, minute, "
+            "recorded_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (plan_id, *new_event, now),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cursor.close()
+        conn.close()
+
+    db.expire_all()
+    return build_actuals_view(db, plan_id), False
+
+
+def get_actuals_baseline(db: Session, plan_id: str) -> models.ActualsBaseline:
+    baseline = db.scalar(
+        select(models.ActualsBaseline).where(
+            models.ActualsBaseline.plan_id == plan_id
+        )
+    )
+    if baseline is None:
+        raise BusinessError(
+            f"方案 {plan_id} 尚未登记任何装船实绩（无冻结排程基线）", 404
+        )
+    return baseline
+
+
+def build_actuals_view(db: Session, plan_id: str) -> dict:
+    """组装实绩查询/登记响应：每箱状态、实际起止、相对冻结排程偏差、未完箱。"""
+    plan = get_plan(db, plan_id)
+    baseline = get_actuals_baseline(db, plan_id)
+    event_rows = list(
+        db.scalars(
+            select(models.ActualsEvent)
+            .where(models.ActualsEvent.plan_id == plan_id)
+        )
+    )
+    events = _actual_events(event_rows)
+    boxes_plan = _baseline_boxes(baseline.items)
+    result = replay(events, boxes_plan, crane_count=baseline.crane_count)
+    state_by_no = {b.no: b for b in result.boxes}
+    plan_by_no = {b.no: b for b in boxes_plan}
+    # 已接受事件必然合法；重放仅用于得到当前状态
+    recorded_by_seq = {r.event_seq: r for r in event_rows}
+
+    box_views = []
+    unfinished = []
+    for no in sorted(plan_by_no):
+        st = state_by_no[no]
+        pb = plan_by_no[no]
+        if st.finish_minute is not None:
+            status = "finished"
+        elif st.start_minute is not None:
+            status = "in_progress"
+        else:
+            status = "not_started"
+        if status != "finished":
+            unfinished.append(no)
+        box_views.append({
+            "container_no": no,
+            "stack": st.stack,
+            "tier": st.tier,
+            "status": status,
+            "actual_start_minute": st.start_minute,
+            "actual_finish_minute": st.finish_minute,
+            "actual_crane_no": st.crane_no,
+            "planned_start_minute": pb.start_minute,
+            "planned_finish_minute": pb.finish_minute,
+            "planned_crane_no": pb.crane_no,
+            "start_minute_delta": (
+                st.start_minute - pb.start_minute
+                if st.start_minute is not None else None
+            ),
+            "finish_minute_delta": (
+                st.finish_minute - pb.finish_minute
+                if st.finish_minute is not None else None
+            ),
+            "crane_changed": (
+                st.crane_no != pb.crane_no
+                if st.crane_no is not None else None
+            ),
+        })
+
+    ordered = order_events(events)
+    event_views = [
+        {
+            "event_seq": e.event_seq,
+            "event_type": e.event_type,
+            "container_no": e.container_no,
+            "crane_no": e.crane_no,
+            "minute": e.minute,
+            "recorded_at": utc_iso(recorded_by_seq[e.event_seq].recorded_at),
+        }
+        for e in ordered
+    ]
+
+    return {
+        "plan_id": plan_id,
+        "revision_no": plan.revision_no,
+        "plan_status": plan.status,
+        "read_only": plan.status != "confirmed",
+        "frozen_at": utc_iso(baseline.frozen_at),
+        "baseline_crane_count": baseline.crane_count,
+        "baseline_makespan": baseline.makespan,
+        "event_count": len(event_rows),
+        "boxes": box_views,
+        "unfinished": unfinished,
+        "events": event_views,
+    }
