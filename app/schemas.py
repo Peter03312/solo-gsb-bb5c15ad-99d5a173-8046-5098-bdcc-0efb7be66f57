@@ -333,6 +333,116 @@ class UnloadingOut(BaseModel):
     created_at: str
 
 
+# ---------- 装船实绩登记（事件重放） ----------
+
+
+class ActualEventIn(BaseModel):
+    seq: int = Field(..., ge=1, description="事件流水号（正整数），同一方案内唯一")
+    event_type: str = Field(
+        ..., description="事件类型：start=开工，finish=完工（同分钟先重放完工）"
+    )
+    container_no: str = Field(..., description="箱号（须在方案中）")
+    crane_no: int = Field(..., ge=1, description="岸桥编号（正整数，须在冻结排程岸桥数量内）")
+    minute: int = Field(..., ge=0, description="实际发生分钟（非负整数）")
+
+    @field_validator("event_type")
+    @classmethod
+    def _event_type(cls, v: str) -> str:
+        if not isinstance(v, str) or not v.strip():
+            raise ValueError("事件类型不能为空")
+        norm = v.strip().lower()
+        if norm not in ("start", "finish"):
+            raise ValueError("事件类型只能为 start（开工）或 finish（完工）")
+        return norm
+
+    @field_validator("container_no")
+    @classmethod
+    def _container_no(cls, v: str) -> str:
+        return _require_nonempty_str(v, "箱号")
+
+
+class ActualEventRegisterIn(BaseModel):
+    events: list[ActualEventIn] = Field(
+        ...,
+        min_length=1,
+        description="本次登记的实际开工/完工事件（可一次登记多条；允许晚到，"
+                    "服务按实际分钟重放全部事件）",
+    )
+
+    @model_validator(mode="after")
+    def _unique(self) -> "ActualEventRegisterIn":
+        seqs = [e.seq for e in self.events]
+        if len(set(seqs)) != len(seqs):
+            dup = sorted({s for s in seqs if seqs.count(s) > 1})
+            raise ValueError(f"本次提交内事件流水号重复：{', '.join(map(str, dup))}")
+        return self
+
+
+class ActualBaselineEntryOut(BaseModel):
+    container_no: str
+    start_minute: int
+    finish_minute: int
+    crane_no: int
+    stack: str
+    tier: int
+
+
+class ActualBoxOut(BaseModel):
+    container_no: str
+    status: str = Field(
+        ..., description="pending=未开工；in_progress=已开工未完工；finished=已完工"
+    )
+    actual_start_minute: int | None
+    actual_finish_minute: int | None
+    actual_crane_no: int | None
+    baseline_start_minute: int | None = Field(
+        ..., description="冻结排程基线开工分钟；无基线箱（不应出现）为 null"
+    )
+    baseline_finish_minute: int | None
+    baseline_crane_no: int | None
+    start_delta_minutes: int | None = Field(
+        ..., description="实际开工-基线开工；未开工为 null（正=延后、负=提前）"
+    )
+    finish_delta_minutes: int | None = Field(
+        ..., description="实际完工-基线完工；未完工为 null（正=延后、负=提前）"
+    )
+    crane_changed: bool | None = Field(
+        ..., description="实际开工岸桥是否与基线不同；未开工为 null"
+    )
+    stack: str
+    tier: int
+
+
+class ActualEventOut(BaseModel):
+    seq: int
+    event_type: str
+    container_no: str
+    crane_no: int
+    minute: int
+    registered_at: str
+
+
+class ActualsOut(BaseModel):
+    plan_id: str
+    revision_no: int
+    plan_status: str = Field(
+        ..., description="confirmed=可继续登记；superseded=方案已被新修订取代，实绩只读"
+    )
+    read_only: bool = Field(..., description="true=方案已被取代，不再接受登记")
+    baseline_frozen_at: str
+    baseline_crane_count: int
+    baseline: list[ActualBaselineEntryOut]
+    containers: list[ActualBoxOut]
+    unfinished_containers: list[str] = Field(
+        ..., description="尚未完工箱号（未开工或已开工未完工），按箱号升序"
+    )
+    replay_order: list[int] = Field(
+        ..., description="按实际分钟重放（同分钟完工先于开工）后的事件流水号顺序"
+    )
+    events: list[ActualEventOut] = Field(..., description="已登记事件（按流水号升序）")
+    created_at: str
+
+
 class AssignmentOut(BaseModel):
     container_no: str
     slot_code: str

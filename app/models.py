@@ -350,3 +350,98 @@ class UnloadingStepRow(Base):
         UniqueConstraint("sequence_id", "container_no",
                          name="uq_unloading_step_container"),
     )
+
+
+class LoadingActuals(Base):
+    """某方案修订的装船实绩登记头（每方案至多一条）。
+
+    首次登记实绩时原子冻结当时绑定的装船排程作为**偏差基线**（行级快照，
+    复制到 LoadingActualBaselineItem）；此后排程被替换（同一方案修订重排）
+    或方案被新修订取代，均不改变已冻结基线与已登记实绩。
+    方案修订被取代后实绩只读：只可查询，不再接受登记。
+    """
+
+    __tablename__ = "loading_actuals"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    plan_id: Mapped[str] = mapped_column(
+        ForeignKey("plans.id", ondelete="CASCADE"), nullable=False, unique=True
+    )
+    # 冻结时刻所绑定排程的岸桥数量（排程删除后仍保留）
+    baseline_crane_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 冻结时排程 id，仅作溯源；排程行被替换删除后可能悬空，故不加外键
+    baseline_schedule_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    baseline_frozen_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    events: Mapped[list["LoadingActualEvent"]] = relationship(
+        back_populates="actuals", cascade="all, delete-orphan"
+    )
+    baseline_items: Mapped[list["LoadingActualBaselineItem"]] = relationship(
+        back_populates="actuals", cascade="all, delete-orphan"
+    )
+    plan: Mapped[Plan] = relationship()
+
+    __table_args__ = (
+        CheckConstraint("baseline_crane_count > 0", name="ck_actuals_cranes"),
+    )
+
+
+class LoadingActualBaselineItem(Base):
+    """冻结排程的逐箱快照：基线开工/完工分钟与岸桥编号。"""
+
+    __tablename__ = "loading_actual_baseline_items"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    actuals_id: Mapped[int] = mapped_column(
+        ForeignKey("loading_actuals.id", ondelete="CASCADE"), index=True
+    )
+    container_no: Mapped[str] = mapped_column(String(64), nullable=False)
+    stack: Mapped[str] = mapped_column(String(64), nullable=False)
+    tier: Mapped[int] = mapped_column(Integer, nullable=False)
+    start_minute: Mapped[int] = mapped_column(Integer, nullable=False)
+    finish_minute: Mapped[int] = mapped_column(Integer, nullable=False)
+    crane_no: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    actuals: Mapped[LoadingActuals] = relationship(back_populates="baseline_items")
+
+    __table_args__ = (
+        UniqueConstraint("actuals_id", "container_no",
+                         name="uq_actual_baseline_container"),
+    )
+
+
+class LoadingActualEvent(Base):
+    """逐箱实际开工/完工事件（只追加，事件流水号在方案内唯一）。
+
+    事件允许晚到；服务按 (实际分钟, 同分钟完工先于开工, 到达先后) 重放。
+    到达先后由自增 id 体现；任一事件使整条重放链非法则整次登记拒绝，
+    已落库事件保持不变。
+    """
+
+    __tablename__ = "loading_actual_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    actuals_id: Mapped[int] = mapped_column(
+        ForeignKey("loading_actuals.id", ondelete="CASCADE"), index=True
+    )
+    seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    event_type: Mapped[str] = mapped_column(String(8), nullable=False)  # start/finish
+    container_no: Mapped[str] = mapped_column(String(64), nullable=False)
+    crane_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    minute: Mapped[int] = mapped_column(Integer, nullable=False)
+    registered_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+
+    actuals: Mapped[LoadingActuals] = relationship(back_populates="events")
+
+    __table_args__ = (
+        UniqueConstraint("actuals_id", "seq", name="uq_actual_event_seq"),
+        CheckConstraint("event_type IN ('start', 'finish')",
+                        name="ck_actual_event_type"),
+        CheckConstraint("crane_no >= 1", name="ck_actual_event_crane"),
+        CheckConstraint("minute >= 0", name="ck_actual_event_minute"),
+    )

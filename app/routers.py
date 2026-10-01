@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Response
 from sqlalchemy.orm import Session
 
 from app import services
 from app.database import get_db
 from app.schemas import (
+    ActualEventRegisterIn,
+    ActualsOut,
     AssignmentOut,
     ManifestIn,
     ManifestRevisionOut,
@@ -363,3 +365,36 @@ def list_unloading_sequences(
 )
 def get_unloading_sequence(plan_id: str, db: Session = Depends(get_db)):
     return _unloading_out(services.get_unloading_sequence(db, plan_id))
+
+
+# ---------- 装船实绩登记（事件重放） ----------
+
+
+@router.post(
+    "/plans/{plan_id}/actual-events",
+    response_model=ActualsOut,
+    responses={404: {"model": MessageOut}, 409: {"model": MessageOut},
+               422: {"model": MessageOut}},
+    summary="登记逐箱实际开工/完工事件（事件可晚到，按实际分钟重放；首次冻结排程基线）",
+)
+def register_actual_events(
+    plan_id: str,
+    body: ActualEventRegisterIn,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    actuals, idempotent_hit = services.register_actual_events(db, plan_id, body)
+    # 同流水号同内容重试返回原结果（200），新事件登记成功为 201
+    response.status_code = 200 if idempotent_hit else 201
+    return services.build_actuals_out(db, actuals)
+
+
+@router.get(
+    "/plans/{plan_id}/actuals",
+    response_model=ActualsOut,
+    responses={404: {"model": MessageOut}},
+    summary="查询装船实绩：每箱状态、实际起止、相对冻结排程偏差与未完箱",
+)
+def get_actuals(plan_id: str, db: Session = Depends(get_db)):
+    actuals = services.get_actuals(db, plan_id)
+    return services.build_actuals_out(db, actuals)

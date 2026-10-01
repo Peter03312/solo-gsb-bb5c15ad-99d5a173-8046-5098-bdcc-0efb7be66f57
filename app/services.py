@@ -8,7 +8,9 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app import models
+from app.actuals import ActualEvent, ActualsReplayError, replay as replay_actuals
 from app.schemas import (
+    ActualEventRegisterIn,
     ManifestIn,
     PlanConfirmIn,
     RestowCreateIn,
@@ -914,6 +916,292 @@ def get_unloading_sequence(db: Session, plan_id: str) -> models.UnloadingSequenc
     if sequence is None:
         raise BusinessError(f"方案 {plan_id} 不存在卸箱顺序", 404)
     return sequence
+
+
+# ---------- 装船实绩登记（事件重放） ----------
+
+
+def _load_actuals_view(db: Session, plan_id: str) -> models.LoadingActuals:
+    actuals = db.scalar(
+        select(models.LoadingActuals).where(models.LoadingActuals.plan_id == plan_id)
+    )
+    if actuals is None:
+        raise BusinessError(f"方案 {plan_id} 尚无装船实绩登记", 404)
+    return actuals
+
+
+def register_actual_events(
+    db: Session,
+    plan_id: str,
+    payload: ActualEventRegisterIn,
+) -> tuple[models.LoadingActuals, bool]:
+    """登记逐箱实际开工/完工事件，返回 (实缋头, 是否为纯重试幂等命中)。
+
+    首次登记时在写锁内原子冻结当时排程作为偏差基线；后续排程替换不影响已登记
+    实绩与基线。方案被新修订取代后实绩只读（409）。事件允许晚到：合并全部已
+    登记事件按实际分钟重放（同分钟完工先于开工）；任一事件使重放链非法则整次
+    拒绝、记录不变（422）。同方案内流水号同内容重试返回原结果，异内容冲突（409）。
+    """
+    plan = get_plan(db, plan_id)
+    plan_nos = {i.container_no for i in plan.items}
+
+    # 锁前快速预检（锁内还会再次核对）：箱必须属于方案
+    for e in payload.events:
+        if e.container_no not in plan_nos:
+            raise BusinessError(
+                f"箱 {e.container_no} 不在方案 {plan_id} 中，拒绝登记实绩",
+                422,
+            )
+
+    incoming = tuple(
+        (e.seq, e.event_type, e.container_no, e.crane_no, e.minute)
+        for e in payload.events
+    )
+    db.rollback()
+
+    from app.database import engine
+
+    conn = engine.pool.connect()
+    cursor = conn.cursor()
+    idempotent_hit = False
+    try:
+        cursor.execute("BEGIN IMMEDIATE")
+
+        # 锁内复核方案状态：方案被新修订取代后实绩只读
+        cursor.execute(
+            "SELECT status FROM plans WHERE id = ?", (plan_id,)
+        )
+        row = cursor.fetchone()
+        if row is None:
+            conn.rollback()
+            raise BusinessError(f"方案 {plan_id} 不存在", 404)
+        plan_status_locked = row[0]
+        if plan_status_locked == "draft":
+            conn.rollback()
+            raise ConflictError(
+                "方案尚未确认（draft），无已确认装船排程，拒绝登记装船实绩"
+            )
+        if plan_status_locked == "superseded":
+            conn.rollback()
+            raise ConflictError(
+                "方案修订已被新修订取代，其装船实绩已冻结为只读，不再接受登记"
+            )
+
+        cursor.execute(
+            "SELECT id, baseline_crane_count FROM loading_actuals WHERE plan_id = ?",
+            (plan_id,),
+        )
+        head = cursor.fetchone()
+
+        if head is None:
+            # 首次登记：原子绑定并冻结当时排程作为偏差基线
+            cursor.execute(
+                "SELECT id, crane_count FROM loading_schedules "
+                "WHERE plan_id = ? AND status = 'current'",
+                (plan_id,),
+            )
+            sch = cursor.fetchone()
+            if sch is None:
+                conn.rollback()
+                raise ConflictError(
+                    f"方案 {plan_id} 没有当前装船排程，须先生成并确认装船时间表，"
+                    "方可登记装船实绩"
+                )
+            schedule_id, crane_count = sch
+            now = models._utcnow().strftime("%Y-%m-%d %H:%M:%S.%f")
+            cursor.execute(
+                "INSERT INTO loading_actuals "
+                "(plan_id, baseline_crane_count, baseline_schedule_id, "
+                "baseline_frozen_at, created_at) VALUES (?, ?, ?, ?, ?)",
+                (plan_id, crane_count, schedule_id, now, now),
+            )
+            actuals_id = cursor.lastrowid
+            cursor.execute(
+                "INSERT INTO loading_actual_baseline_items "
+                "(actuals_id, container_no, stack, tier, start_minute, "
+                "finish_minute, crane_no) "
+                "SELECT ?, container_no, stack, tier, start_minute, finish_minute, "
+                "crane_no FROM loading_schedule_items "
+                "WHERE schedule_id = ?",
+                (actuals_id, schedule_id),
+            )
+        else:
+            actuals_id, crane_count = head
+
+        # 已登记事件（seq -> 内容），用于幂等与冲突判定
+        cursor.execute(
+            "SELECT seq, event_type, container_no, crane_no, minute, id "
+            "FROM loading_actual_events WHERE actuals_id = ? ORDER BY id",
+            (actuals_id,),
+        )
+        existing_rows = cursor.fetchall()
+        existing_by_seq = {r[0]: r for r in existing_rows}
+
+        new_rows: list[tuple] = []
+        for seq, etype, cno, crane_no, minute in incoming:
+            old = existing_by_seq.get(seq)
+            if old is not None:
+                if (old[1], old[2], old[3], old[4]) == (etype, cno, crane_no, minute):
+                    continue  # 同流水号同内容：重试，原结果幂等返回
+                conn.rollback()
+                raise ConflictError(
+                    f"事件流水号 {seq} 已登记且内容不同（已登记："
+                    f"{old[1]} 箱 {old[2]} 桥 {old[3]} 第 {old[4]} 分钟），"
+                    "异内容冲突，本次登记被拒绝且记录不变"
+                )
+            if crane_no > crane_count:
+                conn.rollback()
+                raise BusinessError(
+                    f"事件流水号 {seq}：岸桥编号 {crane_no} 超出冻结排程岸桥数量 "
+                    f"{crane_count}（合法编号 1..{crane_count}），拒绝登记",
+                    422,
+                )
+            new_rows.append((seq, etype, cno, crane_no, minute))
+
+        if not new_rows:
+            # 全部为同内容重试：不写入，直接返回原结果
+            idempotent_hit = True
+            conn.commit()
+        else:
+            # 合并旧事件与新事件，按实际分钟重放（同分钟完工先于开工）。
+            # 新事件尚未落库、无自增 id：同分钟同类型时以已落库事件优先，
+            # 新事件之间按本次提交顺序排（以负序号占位保证排在既有事件之后）。
+            events: list[ActualEvent] = [
+                ActualEvent(
+                    seq=r[0], event_type=r[1], container_no=r[2],
+                    crane_no=r[3], minute=r[4], arrival_id=r[5],
+                )
+                for r in existing_rows
+            ]
+            next_arrival = max((r[5] for r in existing_rows), default=0)
+            for offset, (seq, etype, cno, crane_no, minute) in enumerate(new_rows, start=1):
+                events.append(ActualEvent(
+                    seq=seq, event_type=etype, container_no=cno,
+                    crane_no=crane_no, minute=minute,
+                    arrival_id=next_arrival + offset,
+                ))
+
+            cursor.execute(
+                "SELECT container_no, stack, tier FROM plan_items WHERE plan_id = ?",
+                (plan_id,),
+            )
+            plan_items = [(r[0], r[1], r[2]) for r in cursor.fetchall()]
+            try:
+                replay_actuals(events, plan_items, crane_count)
+            except ActualsReplayError as exc:
+                conn.rollback()
+                raise BusinessError(f"实绩事件重放被拒绝：{exc.reason}", 422)
+
+            cursor.executemany(
+                "INSERT INTO loading_actual_events "
+                "(actuals_id, seq, event_type, container_no, crane_no, minute, "
+                "registered_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (actuals_id, seq, etype, cno, crane_no, minute,
+                     models._utcnow().strftime("%Y-%m-%d %H:%M:%S.%f"))
+                    for seq, etype, cno, crane_no, minute in new_rows
+                ],
+            )
+            conn.commit()
+    except BusinessError:
+        raise
+    except ConflictError:
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cursor.close()
+        conn.close()
+
+    db.expire_all()
+    return _load_actuals_view(db, plan_id), idempotent_hit
+
+
+def get_actuals(db: Session, plan_id: str) -> models.LoadingActuals:
+    # 方案须存在（不存在给 404 方案错误），实绩头不存在给 404 实绩错误
+    get_plan(db, plan_id)
+    return _load_actuals_view(db, plan_id)
+
+
+def build_actuals_out(db: Session, actuals: models.LoadingActuals) -> dict:
+    """重放已登记事件，组装每箱状态、实际起止、相对冻结基线的偏差与未完箱。"""
+    events = [
+        ActualEvent(
+            seq=e.seq, event_type=e.event_type, container_no=e.container_no,
+            crane_no=e.crane_no, minute=e.minute, arrival_id=e.id,
+        )
+        for e in sorted(actuals.events, key=lambda x: x.id)
+    ]
+    plan_items = [(i.container_no, i.stack, i.tier) for i in actuals.plan.items]
+    # 已落库事件必然通过重放校验（防御性仍调用以得到状态）
+    result = replay_actuals(events, plan_items, actuals.baseline_crane_count)
+    boxes = result["boxes"]
+    baseline_by_no = {b.container_no: b for b in actuals.baseline_items}
+
+    containers = []
+    for no in sorted(boxes):
+        box = boxes[no]
+        base = baseline_by_no.get(no)
+        containers.append({
+            "container_no": no,
+            "status": box.status,
+            "actual_start_minute": box.start_minute,
+            "actual_finish_minute": box.finish_minute,
+            "actual_crane_no": box.crane_no,
+            "baseline_start_minute": base.start_minute if base else None,
+            "baseline_finish_minute": base.finish_minute if base else None,
+            "baseline_crane_no": base.crane_no if base else None,
+            "start_delta_minutes": (
+                box.start_minute - base.start_minute
+                if box.start_minute is not None and base is not None else None
+            ),
+            "finish_delta_minutes": (
+                box.finish_minute - base.finish_minute
+                if box.finish_minute is not None and base is not None else None
+            ),
+            "crane_changed": (
+                box.crane_no != base.crane_no
+                if box.crane_no is not None and base is not None else None
+            ),
+            "stack": box.stack,
+            "tier": box.tier,
+        })
+
+    return {
+        "plan_id": actuals.plan_id,
+        "revision_no": actuals.plan.revision_no,
+        "plan_status": actuals.plan.status,
+        "read_only": actuals.plan.status == "superseded",
+        "baseline_frozen_at": utc_iso(actuals.baseline_frozen_at),
+        "baseline_crane_count": actuals.baseline_crane_count,
+        "baseline": [
+            {
+                "container_no": b.container_no,
+                "start_minute": b.start_minute,
+                "finish_minute": b.finish_minute,
+                "crane_no": b.crane_no,
+                "stack": b.stack,
+                "tier": b.tier,
+            }
+            for b in sorted(actuals.baseline_items, key=lambda x: x.container_no)
+        ],
+        "containers": containers,
+        "unfinished_containers": result["unfinished"],
+        "replay_order": result["order"],
+        "events": [
+            {
+                "seq": e.seq,
+                "event_type": e.event_type,
+                "container_no": e.container_no,
+                "crane_no": e.crane_no,
+                "minute": e.minute,
+                "registered_at": utc_iso(e.registered_at),
+            }
+            for e in sorted(actuals.events, key=lambda x: x.seq)
+        ],
+        "created_at": utc_iso(actuals.created_at),
+    }
 
 
 def utc_iso(dt) -> str | None:
